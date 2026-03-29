@@ -1,6 +1,30 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import Icon from "@/components/ui/icon";
 
+const SIGNAL_URL = "https://functions.poehali.dev/c63f149d-8524-48bc-80a7-2add24bbd468";
+
+const ICE_SERVERS = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+];
+
+async function signal(action: string, data: Record<string, unknown> = {}, method = "POST") {
+  const url = `${SIGNAL_URL}/?action=${action}`;
+  if (method === "GET") {
+    const params = new URLSearchParams(data as Record<string, string>);
+    const res = await fetch(`${SIGNAL_URL}/?action=${action}&${params}`);
+    const text = await res.text();
+    return JSON.parse(typeof text === "string" && text.startsWith('"') ? JSON.parse(text) : text);
+  }
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  const text = await res.text();
+  return JSON.parse(typeof text === "string" && text.startsWith('"') ? JSON.parse(text) : text);
+}
+
 type Screen = "home" | "call" | "history" | "settings";
 
 interface CallRecord {
@@ -95,36 +119,49 @@ function PulsingOrb({ color = "cyan", size = 80 }: { color?: "cyan" | "red" | "g
   );
 }
 
+type CallStatus = "idle" | "creating" | "waiting" | "connecting" | "connected" | "ended";
+
 export default function Index() {
   const [screen, setScreen] = useState<Screen>("home");
   const [generatedLink, setGeneratedLink] = useState("");
+  const [sessionId, setSessionId] = useState("");
+  const [joinInput, setJoinInput] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [inCall, setInCall] = useState(false);
+  const [callStatus, setCallStatus] = useState<CallStatus>("idle");
   const [callDuration, setCallDuration] = useState(0);
   const [micOn, setMicOn] = useState(true);
   const [camOn, setCamOn] = useState(true);
   const [frontCam, setFrontCam] = useState(true);
   const [privacy, setPrivacy] = useState({ hideIp: true, obfuscate: true, tunnel: true });
+  const [connError, setConnError] = useState("");
+  const [peerConnected, setPeerConnected] = useState(false);
+
   const localVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const pollRef = useRef<NodeJS.Timeout | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const roleRef = useRef<"offer" | "answer">("offer");
+  const sentIceRef = useRef<Set<string>>(new Set());
 
-  const generateLink = async () => {
-    setIsGenerating(true);
-    await new Promise((r) => setTimeout(r, 1200));
-    const id = Math.random().toString(36).substring(2, 10).toUpperCase();
-    setGeneratedLink(`nexus.call/${id}`);
-    setIsGenerating(false);
-  };
+  const inCall = callStatus === "connecting" || callStatus === "connected" || callStatus === "waiting";
 
-  const copyLink = () => {
-    navigator.clipboard.writeText(`https://${generatedLink}`);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
+  const fmt = (s: number) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 
-  const startCamera = useCallback(async (useFront: boolean) => {
+  // Старт/стоп таймера
+  useEffect(() => {
+    if (callStatus === "connected") {
+      timerRef.current = setInterval(() => setCallDuration((d) => d + 1), 1000);
+    } else {
+      if (timerRef.current) clearInterval(timerRef.current);
+      if (callStatus !== "connecting") setCallDuration(0);
+    }
+    return () => { if (timerRef.current) clearInterval(timerRef.current); };
+  }, [callStatus]);
+
+  const getStream = useCallback(async (useFront: boolean): Promise<MediaStream | null> => {
     try {
       if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -133,34 +170,183 @@ export default function Index() {
       });
       streamRef.current = stream;
       if (localVideoRef.current) localVideoRef.current.srcObject = stream;
-    } catch (_e) { /* camera access denied */ }
+      return stream;
+    } catch (_e) {
+      setConnError("Нет доступа к камере/микрофону");
+      return null;
+    }
   }, []);
 
-  const stopCamera = useCallback(() => {
+  const stopAll = useCallback(() => {
+    if (pollRef.current) clearInterval(pollRef.current);
+    if (pcRef.current) { pcRef.current.close(); pcRef.current = null; }
     if (streamRef.current) { streamRef.current.getTracks().forEach((t) => t.stop()); streamRef.current = null; }
     if (localVideoRef.current) localVideoRef.current.srcObject = null;
+    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+    sentIceRef.current = new Set();
+    setPeerConnected(false);
   }, []);
 
-  useEffect(() => {
-    if (screen === "call") startCamera(frontCam);
-    else stopCamera();
-  }, [screen]);
+  const createPC = useCallback((sid: string, role: "offer" | "answer", stream: MediaStream) => {
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    pcRef.current = pc;
+    roleRef.current = role;
 
-  useEffect(() => {
-    if (screen === "call") startCamera(frontCam);
-  }, [frontCam]);
+    stream.getTracks().forEach((t) => pc.addTrack(t, stream));
 
-  useEffect(() => {
-    if (inCall) {
-      timerRef.current = setInterval(() => setCallDuration((d) => d + 1), 1000);
+    pc.ontrack = (e) => {
+      if (remoteVideoRef.current && e.streams[0]) {
+        remoteVideoRef.current.srcObject = e.streams[0];
+        setPeerConnected(true);
+        setCallStatus("connected");
+      }
+    };
+
+    pc.onicecandidate = async (e) => {
+      if (e.candidate) {
+        const key = JSON.stringify(e.candidate);
+        if (!sentIceRef.current.has(key)) {
+          sentIceRef.current.add(key);
+          await signal("ice", { session_id: sid, candidate: e.candidate.toJSON(), role });
+        }
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
+        setCallStatus("ended");
+        setPeerConnected(false);
+      }
+    };
+
+    return pc;
+  }, []);
+
+  // Polling — ждём ответного SDP / ICE
+  const startPolling = useCallback((sid: string, role: "offer" | "answer") => {
+    let appliedAnswer = false;
+    const addedIce = new Set<string>();
+
+    pollRef.current = setInterval(async () => {
+      try {
+        const data = await signal("poll", { session_id: sid }, "GET");
+        const pc = pcRef.current;
+        if (!pc) return;
+
+        // Callee: получить offer и отправить answer
+        if (role === "answer" && data.offer_sdp && pc.signalingState === "stable") {
+          await pc.setRemoteDescription({ type: "offer", sdp: data.offer_sdp });
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          await signal("answer", { session_id: sid, sdp: answer.sdp });
+          setCallStatus("connecting");
+        }
+
+        // Caller: получить answer
+        if (role === "offer" && data.answer_sdp && !appliedAnswer && pc.signalingState === "have-local-offer") {
+          appliedAnswer = true;
+          await pc.setRemoteDescription({ type: "answer", sdp: data.answer_sdp });
+          setCallStatus("connecting");
+        }
+
+        // ICE от удалённого
+        const remoteIce: RTCIceCandidateInit[] = role === "offer" ? data.answer_ice : data.offer_ice;
+        if (Array.isArray(remoteIce)) {
+          for (const c of remoteIce) {
+            const key = JSON.stringify(c);
+            if (!addedIce.has(key) && pc.remoteDescription) {
+              addedIce.add(key);
+              await pc.addIceCandidate(new RTCIceCandidate(c));
+            }
+          }
+        }
+
+        if (data.status === "ended") {
+          setCallStatus("ended");
+          stopAll();
+          if (pollRef.current) clearInterval(pollRef.current);
+        }
+      } catch (_e) { /* ignore polling errors */ }
+    }, 1500);
+  }, [stopAll]);
+
+  // Создать звонок (caller)
+  const createCall = async () => {
+    setIsGenerating(true);
+    setConnError("");
+    const stream = await getStream(frontCam);
+    if (!stream) { setIsGenerating(false); return; }
+
+    const data = await signal("create");
+    const sid: string = data.session_id;
+    setSessionId(sid);
+    setGeneratedLink(`${window.location.origin}?join=${sid}`);
+
+    const pc = createPC(sid, "offer", stream);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await signal("offer", { session_id: sid, sdp: offer.sdp });
+
+    setIsGenerating(false);
+    setCallStatus("waiting");
+    setScreen("call");
+    startPolling(sid, "offer");
+  };
+
+  // Войти в звонок (callee)
+  const joinCall = async (sid: string) => {
+    setConnError("");
+    const stream = await getStream(frontCam);
+    if (!stream) return;
+
+    setSessionId(sid);
+    setCallStatus("connecting");
+    setScreen("call");
+
+    const pc = createPC(sid, "answer", stream);
+    startPolling(sid, "answer");
+    // callee сразу создаёт PC — offer придёт через polling
+    void pc;
+  };
+
+  const copyLink = () => {
+    navigator.clipboard.writeText(generatedLink);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  // Переключение камеры
+  const flipCamera = useCallback(async () => {
+    const newFront = !frontCam;
+    setFrontCam(newFront);
+    if (streamRef.current && pcRef.current) {
+      try {
+        const newStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: newFront ? "user" : "environment" },
+          audio: false,
+        });
+        const newVideoTrack = newStream.getVideoTracks()[0];
+        const sender = pcRef.current.getSenders().find((s) => s.track?.kind === "video");
+        if (sender) await sender.replaceTrack(newVideoTrack);
+        // Заменить трек в streamRef
+        const oldVideo = streamRef.current.getVideoTracks()[0];
+        if (oldVideo) { streamRef.current.removeTrack(oldVideo); oldVideo.stop(); }
+        streamRef.current.addTrack(newVideoTrack);
+        if (localVideoRef.current) localVideoRef.current.srcObject = streamRef.current;
+      } catch (_e) { /* ignore */ }
     } else {
-      if (timerRef.current) clearInterval(timerRef.current);
-      setCallDuration(0);
+      getStream(newFront);
     }
-    return () => { if (timerRef.current) clearInterval(timerRef.current); };
-  }, [inCall]);
+  }, [frontCam, getStream]);
 
-  const fmt = (s: number) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+  const endCall = async () => {
+    if (sessionId) await signal("end", { session_id: sessionId }).catch(() => {});
+    stopAll();
+    setCallStatus("idle");
+    setSessionId("");
+    setGeneratedLink("");
+    setScreen("home");
+  };
 
   const toggleMic = () => {
     streamRef.current?.getAudioTracks().forEach((t) => { t.enabled = !micOn; });
@@ -171,6 +357,15 @@ export default function Index() {
     streamRef.current?.getVideoTracks().forEach((t) => { t.enabled = !camOn; });
     setCamOn((v) => !v);
   };
+
+  // Обработка join-ссылки из URL
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const joinId = params.get("join");
+    if (joinId) {
+      setJoinInput(joinId);
+    }
+  }, []);
 
   return (
     <div className="min-h-screen bg-cyber-dark font-rajdhani relative overflow-hidden">
@@ -218,30 +413,35 @@ export default function Index() {
       <main className="relative z-10">
         {screen === "home" && (
           <HomeScreen
-            onGenerate={generateLink}
+            onCreateCall={createCall}
+            onJoinCall={joinCall}
             generatedLink={generatedLink}
             isGenerating={isGenerating}
             copied={copied}
             onCopy={copyLink}
-            onStartCall={() => setScreen("call")}
             privacy={privacy}
+            joinInput={joinInput}
+            setJoinInput={setJoinInput}
+            connError={connError}
           />
         )}
         {screen === "call" && (
           <CallScreen
             localVideoRef={localVideoRef}
-            inCall={inCall}
+            remoteVideoRef={remoteVideoRef}
+            callStatus={callStatus}
+            peerConnected={peerConnected}
             callDuration={callDuration}
             fmt={fmt}
             micOn={micOn}
             camOn={camOn}
             frontCam={frontCam}
             privacy={privacy}
+            sessionId={sessionId}
             onMic={toggleMic}
             onCam={toggleCam}
-            onFlip={() => setFrontCam((v) => !v)}
-            onEnd={() => { setInCall(false); setScreen("home"); }}
-            onStart={() => setInCall(true)}
+            onFlip={flipCamera}
+            onEnd={endCall}
           />
         )}
         {screen === "history" && <HistoryScreen records={MOCK_HISTORY} />}
@@ -251,15 +451,27 @@ export default function Index() {
   );
 }
 
-function HomeScreen({ onGenerate, generatedLink, isGenerating, copied, onCopy, onStartCall, privacy }: {
-  onGenerate: () => void;
+function HomeScreen({ onCreateCall, onJoinCall, generatedLink, isGenerating, copied, onCopy, privacy, joinInput, setJoinInput, connError }: {
+  onCreateCall: () => void;
+  onJoinCall: (sid: string) => void;
   generatedLink: string;
   isGenerating: boolean;
   copied: boolean;
   onCopy: () => void;
-  onStartCall: () => void;
   privacy: { hideIp: boolean; obfuscate: boolean; tunnel: boolean };
+  joinInput: string;
+  setJoinInput: (v: string) => void;
+  connError: string;
 }) {
+  const extractId = (val: string) => {
+    try {
+      const u = new URL(val);
+      return u.searchParams.get("join") || val.trim();
+    } catch {
+      return val.trim();
+    }
+  };
+
   return (
     <div className="max-w-4xl mx-auto px-6 py-12 animate-fade-in">
       {/* Hero */}
@@ -272,7 +484,7 @@ function HomeScreen({ onGenerate, generatedLink, isGenerating, copied, onCopy, o
           <span className="text-cyber-cyan cyber-text-glow">СВЯЗЬ</span>
         </h2>
         <p className="font-rajdhani text-lg text-muted-foreground max-w-md mx-auto">
-          Видеозвонки без следов. Анонимность. Шифрование. Никакой слежки.
+          Реальные P2P видеозвонки. Без серверов между вами. Без слежки.
         </p>
         <div className="flex justify-center gap-6 mt-5">
           {([
@@ -289,139 +501,190 @@ function HomeScreen({ onGenerate, generatedLink, isGenerating, copied, onCopy, o
         </div>
       </div>
 
-      {/* Generate */}
-      <div className="cyber-panel corner-clip p-8 mb-6 scan-line">
-        <div className="flex items-center gap-2 mb-4">
-          <div className="status-dot" />
-          <span className="font-orbitron text-xs text-cyber-cyan tracking-widest">ГЕНЕРАЦИЯ СЕССИИ</span>
+      {connError && (
+        <div className="mb-4 p-3 corner-clip-sm border border-red-500/40 bg-red-500/10 text-red-400 font-mono-cyber text-xs text-center">
+          ⚠ {connError}
         </div>
-        <EnergyBar active={isGenerating} />
-        <div className="mt-5 space-y-4">
+      )}
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+        {/* Создать звонок */}
+        <div className="cyber-panel corner-clip p-6 scan-line">
+          <div className="flex items-center gap-2 mb-4">
+            <div className="status-dot" />
+            <span className="font-orbitron text-xs text-cyber-cyan tracking-widest">НОВЫЙ ЗВОНОК</span>
+          </div>
+          <p className="font-rajdhani text-sm text-muted-foreground mb-5">
+            Создайте защищённую сессию и поделитесь ссылкой с собеседником
+          </p>
+          <EnergyBar active={isGenerating} />
           <button
-            onClick={onGenerate}
+            onClick={onCreateCall}
             disabled={isGenerating}
-            className="w-full py-4 cyber-btn font-orbitron text-sm tracking-widest font-bold disabled:opacity-50"
+            className="w-full mt-4 py-4 cyber-btn font-orbitron text-sm tracking-widest font-bold disabled:opacity-50"
           >
             {isGenerating ? (
               <span className="flex items-center justify-center gap-2">
                 <Icon name="Loader2" size={16} className="animate-spin" />
-                ГЕНЕРАЦИЯ КЛЮЧА...
+                ИНИЦИАЛИЗАЦИЯ...
               </span>
             ) : (
               <span className="flex items-center justify-center gap-2">
                 <Icon name="Zap" size={16} />
-                СОЗДАТЬ ЗАЩИЩЁННУЮ ССЫЛКУ
+                СОЗДАТЬ ЗВОНОК
               </span>
             )}
           </button>
 
           {generatedLink && (
-            <div className="animate-scale-in space-y-3">
-              <div className="p-4 corner-clip-sm flex items-center justify-between gap-4" style={{ border: "1px solid var(--cyber-cyan)", boxShadow: "var(--cyber-glow)" }}>
-                <div>
-                  <div className="font-mono-cyber text-[9px] text-muted-foreground mb-1">SESSION_LINK</div>
-                  <div className="font-mono-cyber text-cyber-cyan cyber-text-glow text-sm">{generatedLink}</div>
+            <div className="mt-4 animate-scale-in">
+              <div className="p-3 corner-clip-sm flex items-center justify-between gap-3" style={{ border: "1px solid var(--cyber-cyan)", boxShadow: "var(--cyber-glow)" }}>
+                <div className="min-w-0">
+                  <div className="font-mono-cyber text-[9px] text-muted-foreground mb-1">ССЫЛКА ДЛЯ СОБЕСЕДНИКА</div>
+                  <div className="font-mono-cyber text-cyber-cyan text-xs truncate">{generatedLink}</div>
                 </div>
                 <button
                   onClick={onCopy}
-                  className={`px-4 py-2 font-orbitron text-xs transition-all corner-clip-sm ${copied ? "text-cyber-cyan border border-cyber-cyan bg-cyber-cyan/10" : "cyber-btn-gold"}`}
+                  className={`flex-shrink-0 px-3 py-2 font-orbitron text-xs corner-clip-sm transition-all ${copied ? "text-cyber-cyan border border-cyber-cyan bg-cyber-cyan/10" : "cyber-btn-gold"}`}
                 >
                   {copied
-                    ? <span className="flex items-center gap-1"><Icon name="Check" size={12} /> OK</span>
-                    : <span className="flex items-center gap-1"><Icon name="Copy" size={12} /> КОПИРОВАТЬ</span>
+                    ? <span className="flex items-center gap-1"><Icon name="Check" size={12} /></span>
+                    : <span className="flex items-center gap-1"><Icon name="Copy" size={12} /> COPY</span>
                   }
                 </button>
               </div>
-              <div className="grid grid-cols-3 gap-2">
-                {[{ l: "ШИФРОВАНИЕ", v: "AES-256" }, { l: "МАРШРУТ", v: "3 HOP" }, { l: "СТАТУС", v: "ГОТОВ" }].map(({ l, v }) => (
-                  <div key={l} className="cyber-panel p-2 text-center corner-clip-sm">
-                    <div className="font-mono-cyber text-[9px] text-muted-foreground">{l}</div>
-                    <div className="font-mono-cyber text-xs text-cyber-cyan">{v}</div>
-                  </div>
-                ))}
+              <div className="mt-2 font-mono-cyber text-[10px] text-cyber-cyan/60 text-center animate-pulse-text">
+                ⟳ ОЖИДАЕМ СОБЕСЕДНИКА...
               </div>
             </div>
           )}
         </div>
+
+        {/* Войти по ссылке */}
+        <div className="cyber-panel corner-clip p-6">
+          <div className="flex items-center gap-2 mb-4">
+            <div className="w-2 h-2 rounded-full bg-cyber-gold shadow-[0_0_6px_#ffd60a]" style={{ animation: "pulse-glow 2s infinite" }} />
+            <span className="font-orbitron text-xs text-cyber-gold tracking-widest">ВОЙТИ В ЗВОНОК</span>
+          </div>
+          <p className="font-rajdhani text-sm text-muted-foreground mb-5">
+            Вставьте ссылку или ID сессии, которую прислал собеседник
+          </p>
+          <input
+            type="text"
+            value={joinInput}
+            onChange={(e) => setJoinInput(e.target.value)}
+            placeholder="https://... или ID сессии"
+            className="w-full bg-cyber-dark border border-cyber-border text-white font-mono-cyber text-xs p-3 focus:outline-none focus:border-cyber-gold transition-colors mb-3"
+            style={{ clipPath: "polygon(6px 0%, 100% 0%, calc(100% - 6px) 100%, 0% 100%)" }}
+            onKeyDown={(e) => { if (e.key === "Enter" && joinInput.trim()) onJoinCall(extractId(joinInput)); }}
+          />
+          <button
+            onClick={() => { if (joinInput.trim()) onJoinCall(extractId(joinInput)); }}
+            disabled={!joinInput.trim()}
+            className="w-full py-4 cyber-btn-gold font-orbitron text-sm tracking-widest font-bold disabled:opacity-40 corner-clip-sm flex items-center justify-center gap-2"
+          >
+            <Icon name="PhoneCall" size={15} />
+            ПОДКЛЮЧИТЬСЯ
+          </button>
+        </div>
       </div>
 
-      {/* Quick actions */}
-      <div className="grid grid-cols-2 gap-4">
-        <button onClick={onStartCall} className="cyber-panel corner-clip p-6 text-left transition-all group hover:border-cyber-cyan/40" style={{ border: "1px solid var(--cyber-border)" }}>
-          <div className="flex items-center gap-3 mb-2">
-            <div className="w-9 h-9 flex items-center justify-center" style={{ border: "1px solid var(--cyber-cyan)", background: "rgba(0,255,245,0.05)", clipPath: "polygon(4px 0%, 100% 0%, calc(100% - 4px) 100%, 0% 100%)" }}>
-              <Icon name="Video" size={18} className="text-cyber-cyan" />
-            </div>
-            <span className="font-orbitron text-sm text-white group-hover:text-cyber-cyan transition-colors">ВОЙТИ В ЗВОНОК</span>
+      {/* Info */}
+      <div className="cyber-panel corner-clip p-4 grid grid-cols-3 gap-3" style={{ border: "1px solid var(--cyber-border)" }}>
+        {[
+          { icon: "Wifi", label: "WebRTC P2P", desc: "Прямое соединение" },
+          { icon: "Shield", label: "E2E", desc: "Сквозное шифрование" },
+          { icon: "EyeOff", label: "Анонимность", desc: "IP не передаётся" },
+        ].map(({ icon, label, desc }) => (
+          <div key={label} className="text-center">
+            <Icon name={icon} size={18} className="text-cyber-cyan mx-auto mb-1" />
+            <div className="font-orbitron text-xs text-white">{label}</div>
+            <div className="font-mono-cyber text-[9px] text-muted-foreground">{desc}</div>
           </div>
-          <p className="font-rajdhani text-xs text-muted-foreground">Подключиться по ссылке</p>
-        </button>
-
-        <div className="cyber-panel corner-clip p-6" style={{ border: "1px solid var(--cyber-border)" }}>
-          <div className="flex items-center gap-3 mb-2">
-            <div className="w-9 h-9 flex items-center justify-center" style={{ border: "1px solid var(--cyber-gold)", background: "rgba(255,214,10,0.05)", clipPath: "polygon(4px 0%, 100% 0%, calc(100% - 4px) 100%, 0% 100%)" }}>
-              <Icon name="ShieldCheck" size={18} className="text-cyber-gold" />
-            </div>
-            <span className="font-orbitron text-sm text-white">ЗАЩИТА АКТИВНА</span>
-          </div>
-          <p className="font-rajdhani text-xs text-muted-foreground">IP скрыт · Провайдер не видит</p>
-        </div>
+        ))}
       </div>
     </div>
   );
 }
 
-function CallScreen({ localVideoRef, inCall, callDuration, fmt, micOn, camOn, frontCam, privacy, onMic, onCam, onFlip, onEnd, onStart }: {
+function CallScreen({ localVideoRef, remoteVideoRef, callStatus, peerConnected, callDuration, fmt, micOn, camOn, frontCam, privacy, sessionId, onMic, onCam, onFlip, onEnd }: {
   localVideoRef: React.RefObject<HTMLVideoElement>;
-  inCall: boolean;
+  remoteVideoRef: React.RefObject<HTMLVideoElement>;
+  callStatus: CallStatus;
+  peerConnected: boolean;
   callDuration: number;
   fmt: (s: number) => string;
   micOn: boolean;
   camOn: boolean;
   frontCam: boolean;
   privacy: { hideIp: boolean; obfuscate: boolean; tunnel: boolean };
+  sessionId: string;
   onMic: () => void;
   onCam: () => void;
   onFlip: () => void;
   onEnd: () => void;
-  onStart: () => void;
 }) {
+  const statusLabel: Record<CallStatus, string> = {
+    idle: "ОЖИДАНИЕ",
+    creating: "ИНИЦИАЛИЗАЦИЯ",
+    waiting: "ЖДЁМ СОБЕСЕДНИКА",
+    connecting: "СОЕДИНЕНИЕ...",
+    connected: "СОЕДИНЕНО",
+    ended: "ЗАВЕРШЁН",
+  };
+  const isActive = callStatus === "connected" || callStatus === "connecting" || callStatus === "waiting";
+
   return (
     <div className="max-w-5xl mx-auto px-6 py-8 animate-fade-in">
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Video area */}
         <div className="lg:col-span-2 space-y-4">
-          {/* Remote */}
+          {/* Remote video */}
           <div className="relative corner-clip overflow-hidden" style={{ aspectRatio: "16/9", background: "linear-gradient(135deg, #060d14, #0a1a24)", border: "1px solid var(--cyber-border)" }}>
             <div className="absolute inset-0 grid-bg" />
-            <div className="absolute inset-0 flex items-center justify-center">
-              {inCall
-                ? <div className="text-center"><PulsingOrb color="cyan" size={80} /><p className="font-mono-cyber text-xs text-muted-foreground mt-4">PEER CONNECTED</p></div>
-                : <div className="text-center"><PulsingOrb color="gold" size={80} /><p className="font-orbitron text-xs text-muted-foreground mt-4 tracking-widest">ОЖИДАНИЕ СОЕДИНЕНИЯ</p></div>
-              }
-            </div>
-            {/* HUD top-left */}
+            {/* Показываем video элемент всегда, но поверх — overlay если нет пира */}
+            <video
+              ref={remoteVideoRef}
+              autoPlay
+              playsInline
+              className="absolute inset-0 w-full h-full object-cover"
+              style={{ opacity: peerConnected ? 1 : 0, transition: "opacity 0.5s" }}
+            />
+            {!peerConnected && (
+              <div className="absolute inset-0 flex items-center justify-center">
+                {callStatus === "waiting"
+                  ? <div className="text-center">
+                      <PulsingOrb color="gold" size={80} />
+                      <p className="font-orbitron text-xs text-cyber-gold mt-4 tracking-widest animate-pulse-text">ОЖИДАЕМ СОБЕСЕДНИКА</p>
+                      {sessionId && <p className="font-mono-cyber text-[9px] text-muted-foreground mt-1">ID: {sessionId}</p>}
+                    </div>
+                  : <div className="text-center">
+                      <PulsingOrb color="cyan" size={80} />
+                      <p className="font-orbitron text-xs text-muted-foreground mt-4 tracking-widest">{statusLabel[callStatus]}</p>
+                    </div>
+                }
+              </div>
+            )}
+            {/* HUD */}
             <div className="absolute top-3 left-3 font-mono-cyber text-[9px] text-cyber-cyan/50 space-y-0.5">
-              <div>RES: 1080p</div><div>CODEC: VP9</div><div>LAT: 12ms</div>
+              <div>WebRTC P2P</div><div>E2E·DTLS</div>
             </div>
-            {inCall && (
-              <div className="absolute top-3 right-3 flex items-center gap-1.5 bg-black/50 px-2 py-1 corner-clip-sm">
-                <div className="w-2 h-2 rounded-full bg-red-500 shadow-[0_0_6px_#ff0055]" style={{ animation: "pulse-glow 1s infinite" }} />
+            {isActive && (
+              <div className="absolute top-3 right-3 flex items-center gap-1.5 bg-black/60 px-2 py-1 corner-clip-sm">
+                <div className="w-2 h-2 rounded-full bg-red-500" style={{ boxShadow: "0 0 6px #ff0055", animation: "pulse-glow 1s infinite" }} />
                 <span className="font-mono-cyber text-xs text-white">{fmt(callDuration)}</span>
               </div>
             )}
-            {/* Corners */}
             <div className="absolute top-0 left-0 w-5 h-5 border-t-2 border-l-2 border-cyber-cyan/30" />
             <div className="absolute top-0 right-0 w-5 h-5 border-t-2 border-r-2 border-cyber-cyan/30" />
             <div className="absolute bottom-0 left-0 w-5 h-5 border-b-2 border-l-2 border-cyber-cyan/30" />
             <div className="absolute bottom-0 right-0 w-5 h-5 border-b-2 border-r-2 border-cyber-cyan/30" />
-            {/* Bottom bar */}
-            <div className="absolute bottom-0 left-0 right-0 p-3 flex items-center justify-between" style={{ background: "linear-gradient(transparent, rgba(6,10,16,0.8))" }}>
+            <div className="absolute bottom-0 left-0 right-0 p-3 flex items-center justify-between" style={{ background: "linear-gradient(transparent, rgba(6,10,16,0.85))" }}>
               <div className="flex items-center gap-1.5">
                 <div className={`w-1.5 h-1.5 rounded-full ${privacy.hideIp ? "bg-cyber-cyan shadow-[0_0_5px_#00fff5]" : "bg-muted"}`} />
                 <span className="font-mono-cyber text-[9px] text-cyber-cyan/70">IP: MASKED</span>
               </div>
-              <div className="font-mono-cyber text-[9px] text-muted-foreground">E2E ENCRYPTED</div>
+              <div className="font-mono-cyber text-[9px] text-muted-foreground">SRTP · DTLS · E2E</div>
             </div>
           </div>
 
@@ -442,11 +705,11 @@ function CallScreen({ localVideoRef, inCall, callDuration, fmt, micOn, camOn, fr
                 { l: "ВИДЕО", v: camOn ? "АКТИВЕН" : "ОТКЛ", ok: camOn },
                 { l: "АУДИО", v: micOn ? "АКТИВЕН" : "МУТ", ok: micOn },
                 { l: "КАМЕРА", v: frontCam ? "ФРОНТ" : "ОСНОВНАЯ", ok: true },
-                { l: "МАРШРУТ", v: privacy.tunnel ? "TOR·3HOP" : "ПРЯМОЙ", ok: privacy.tunnel },
+                { l: "P2P", v: peerConnected ? "УСТАНОВЛЕН" : "ПОИСК", ok: peerConnected },
               ].map(({ l, v, ok }) => (
                 <div key={l} className="flex justify-between">
                   <span className="font-mono-cyber text-[10px] text-muted-foreground">{l}</span>
-                  <span className={`font-mono-cyber text-[10px] ${ok ? "text-cyber-cyan" : "text-red-400"}`}>{v}</span>
+                  <span className={`font-mono-cyber text-[10px] ${ok ? "text-cyber-cyan" : "text-cyber-gold"}`}>{v}</span>
                 </div>
               ))}
             </div>
@@ -458,11 +721,15 @@ function CallScreen({ localVideoRef, inCall, callDuration, fmt, micOn, camOn, fr
           <div className="cyber-panel corner-clip p-4">
             <div className="flex items-center justify-between mb-2">
               <span className="font-orbitron text-xs text-cyber-cyan tracking-wider">СТАТУС</span>
-              <div className={`w-2 h-2 rounded-full ${inCall ? "bg-cyber-cyan shadow-[0_0_6px_#00fff5]" : "bg-cyber-gold shadow-[0_0_6px_#ffd60a]"}`} style={{ animation: "pulse-glow 2s infinite" }} />
+              <div className={`w-2 h-2 rounded-full ${
+                peerConnected ? "bg-cyber-cyan shadow-[0_0_6px_#00fff5]" :
+                callStatus === "waiting" ? "bg-cyber-gold shadow-[0_0_6px_#ffd60a]" :
+                "bg-muted"
+              }`} style={{ animation: "pulse-glow 2s infinite" }} />
             </div>
-            <div className="font-mono-cyber text-2xl text-white mb-1">{inCall ? fmt(callDuration) : "00:00"}</div>
-            <div className="font-mono-cyber text-[9px] text-muted-foreground mb-2">{inCall ? "СОЕДИНЕНИЕ АКТИВНО" : "ОЖИДАНИЕ"}</div>
-            <EnergyBar active={inCall} />
+            <div className="font-mono-cyber text-2xl text-white mb-1">{fmt(callDuration)}</div>
+            <div className="font-mono-cyber text-[9px] text-muted-foreground mb-2">{statusLabel[callStatus]}</div>
+            <EnergyBar active={isActive} />
           </div>
 
           <div className="cyber-panel corner-clip p-4 space-y-2">
@@ -496,17 +763,10 @@ function CallScreen({ localVideoRef, inCall, callDuration, fmt, micOn, camOn, fr
             ))}
           </div>
 
-          {!inCall ? (
-            <button onClick={onStart} className="w-full py-4 cyber-btn font-orbitron text-sm tracking-widest font-bold animate-pulse-glow flex items-center justify-center gap-2">
-              <Icon name="PhoneCall" size={15} />
-              НАЧАТЬ ЗВОНОК
-            </button>
-          ) : (
-            <button onClick={onEnd} className="w-full py-4 cyber-btn-danger font-orbitron text-sm tracking-widest font-bold flex items-center justify-center gap-2 transition-all hover:scale-105">
-              <Icon name="PhoneOff" size={15} />
-              ЗАВЕРШИТЬ
-            </button>
-          )}
+          <button onClick={onEnd} className="w-full py-4 cyber-btn-danger font-orbitron text-sm tracking-widest font-bold flex items-center justify-center gap-2 transition-all hover:scale-105">
+            <Icon name="PhoneOff" size={15} />
+            ЗАВЕРШИТЬ
+          </button>
         </div>
       </div>
     </div>

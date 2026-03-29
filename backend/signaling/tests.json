@@ -1,0 +1,19 @@
+{
+  "tests": [
+    {
+      "name": "Create session",
+      "method": "POST",
+      "path": "/?action=create",
+      "body": {},
+      "expectedStatus": 200,
+      "bodyMatcher": "none"
+    },
+    {
+      "name": "Poll unknown session",
+      "method": "GET",
+      "path": "/?action=poll&session_id=NOTEXIST",
+      "expectedStatus": 404,
+      "bodyMatcher": "none"
+    }
+  ]
+}
